@@ -2,7 +2,7 @@ import streamlit as st
 import tempfile
 import os
 from ingestion import HybridIndexer
-
+from openai import OpenAI
 st.set_page_config(page_title="RAG Fusion Dashboard", layout="wide")
 st.title("Hybrid RAG: Retrieval Quality Dashboard")
 
@@ -89,3 +89,54 @@ if query and query.strip():
         results_sparse = indexer.hybrid_search(query, top_k=top_k, alpha=0.0)
         for i, res in enumerate(results_sparse, 1):
             render_result_card(res, i)
+    
+    st.divider()
+    st.header("4. Synthesized Answer (Local LLM)")
+    
+    col_llm1, col_llm2, col_llm3 = st.columns(3)
+    with col_llm1:
+        llm_base_url = st.text_input("Local Base URL", value="http://localhost:8000/v1") 
+    with col_llm2:
+        llm_model_name = st.text_input("Model Name", value="local-model")
+    with col_llm3:
+        llm_api_key = st.text_input("API Key", type="password", value="")
+
+    if st.button("Generate Answer from Hybrid Context"):
+        context_texts = []
+        for i, res in enumerate(results_hybrid, 1):
+            source = res.get("payload", {}).get("source", "Unknown")
+            text = res.get("payload", {}).get("text", "")
+            context_texts.append(f"--- Document [{i}] (Source: {source}) ---\n{text}")
+        
+        context_block = "\n\n".join(context_texts)
+        
+        system_prompt = """You are a helpful technical assistant. Answer the user's question based ONLY on the provided context. 
+        If the context does not contain the answer, explicitly state 'I cannot answer this based on the provided documents.'
+        Always cite the Document number when making a claim."""
+        
+        user_prompt = f"Context:\n{context_block}\n\nQuestion: {query}"
+        
+        client = OpenAI(base_url=llm_base_url, api_key=llm_api_key if llm_api_key else "dummy-key")
+        
+        def token_generator(stream):
+            for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content is not None:
+                    yield chunk.choices[0].delta.content
+
+        try:
+            st.markdown("### Answer")
+            response = client.chat.completions.create(
+                model=llm_model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.1, 
+                stream=True
+            )
+            
+            st.write_stream(token_generator(response))
+                
+        except Exception as e:
+            st.error(f"Failed to connect to Local LLM at {llm_base_url}")
+            st.error(f"Detailed error: {e}")
