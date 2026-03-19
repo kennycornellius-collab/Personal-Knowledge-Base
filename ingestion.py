@@ -44,8 +44,10 @@ class HybridIndexer:
     def tokenize_for_bm25(self, text: str) -> List[str]:
         return [word for word in re.split(r'\W+', text.lower()) if word]
 
-    def ingest_document(self, file_path: str, chunk_size: int = 500, chunk_overlap: int = 50):
-        print(f"\n--- Ingesting: {Path(file_path).name} ---")
+    def ingest_document(self, file_path: str, chunk_size: int = 500, chunk_overlap: int = 50, source_name: str = None):
+        display_name = source_name or Path(file_path).name
+        print(f"\n--- Ingesting: {display_name} ---")
+        
         raw_text = self.extract_text(file_path)
 
         splitter = RecursiveCharacterTextSplitter(
@@ -64,9 +66,9 @@ class HybridIndexer:
         print("Preparing payloads and updating indices")
         for i, chunk_text in enumerate(chunks):
             chunk_id = str(uuid.uuid4())
-
+            
             metadata = {
-                "source": Path(file_path).name,
+                "source": display_name, 
                 "chunk_index": i,
                 "text": chunk_text
             }
@@ -91,14 +93,12 @@ class HybridIndexer:
 
     def search_dense(self, query: str, limit: int = 50) -> List[dict]:
         query_vector = self.embedding_model.encode(query).tolist()
-        
-        results = self.qdrant.search(
+        response = self.qdrant.query_points(
             collection_name=self.collection_name,
-            query_vector=query_vector,
+            query=query_vector, 
             limit=limit
         )
-        
-        return [{"chunk_id": res.id, "score": res.score, "payload": res.payload} for res in results]
+        return [{"chunk_id": res.id, "score": res.score, "payload": res.payload} for res in response.points]
 
     def search_sparse(self, query: str, limit: int = 50) -> List[dict]:
         if not self.bm25_index:
