@@ -88,7 +88,80 @@ class HybridIndexer:
         )
         self.bm25_index = BM25Okapi(self.bm25_tokenized)
         
-        print("Ingestion complete!")
+
+    def search_dense(self, query: str, limit: int = 50) -> List[dict]:
+        query_vector = self.embedding_model.encode(query).tolist()
+        
+        results = self.qdrant.search(
+            collection_name=self.collection_name,
+            query_vector=query_vector,
+            limit=limit
+        )
+        
+        return [{"chunk_id": res.id, "score": res.score, "payload": res.payload} for res in results]
+
+    def search_sparse(self, query: str, limit: int = 50) -> List[dict]:
+        if not self.bm25_index:
+            return []
+            
+        tokenized_query = self.tokenize_for_bm25(query)
+        scores = self.bm25_index.get_scores(tokenized_query)
+        
+        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:limit]
+        
+        results = []
+        for idx in top_indices:
+            if scores[idx] > 0: 
+                results.append({
+                    "chunk_id": self.bm25_id_map[idx], 
+                    "score": scores[idx],
+                    "payload": None 
+                })
+        return results
+
+    def hybrid_search(self, query: str, top_k: int = 5, alpha: float = 0.5, rrf_k: int = 60) -> List[dict]:
+        
+        pool_size = max(top_k * 3, 50) 
+
+        dense_results = self.search_dense(query, limit=pool_size) if alpha > 0.0 else []
+        sparse_results = self.search_sparse(query, limit=pool_size) if alpha < 1.0 else []
+        
+        dense_rank_map = {res["chunk_id"]: rank for rank, res in enumerate(dense_results, 1)}
+        sparse_rank_map = {res["chunk_id"]: rank for rank, res in enumerate(sparse_results, 1)}
+        
+        payload_map = {res["chunk_id"]: res["payload"] for res in dense_results if res["payload"]}
+        
+        all_uuids = set(dense_rank_map.keys()).union(set(sparse_rank_map.keys()))
+
+        missing_ids = [uid for uid in all_uuids if uid not in payload_map]
+        if missing_ids:
+            fetched_points = self.qdrant.retrieve(
+                collection_name=self.collection_name, 
+                ids=missing_ids
+            )
+            for point in fetched_points:
+                payload_map[point.id] = point.payload
+
+        fused_results = []
+        for chunk_id in all_uuids:
+            dense_rank = dense_rank_map.get(chunk_id, None)
+            sparse_rank = sparse_rank_map.get(chunk_id, None)
+            
+            dense_rrf = 1.0 / (rrf_k + dense_rank) if dense_rank else 0.0
+            sparse_rrf = 1.0 / (rrf_k + sparse_rank) if sparse_rank else 0.0
+            
+            final_score = (alpha * dense_rrf) + ((1.0 - alpha) * sparse_rrf)
+            
+            fused_results.append({
+                "chunk_id": chunk_id,
+                "fused_score": final_score,
+                "dense_rank": dense_rank,
+                "sparse_rank": sparse_rank,
+                "payload": payload_map.get(chunk_id, {}) 
+            })
+            
+        fused_results.sort(key=lambda x: x["fused_score"], reverse=True)
+        return fused_results[:top_k]
 
 if __name__ == "__main__":
     pipeline = HybridIndexer()
@@ -107,7 +180,22 @@ if __name__ == "__main__":
     qdrant_count = pipeline.qdrant.count(pipeline.collection_name).count
     bm25_count = len(pipeline.bm25_id_map)
     
-    print("\n--- Multi-Doc Sanity Check ---")
-    print(f"Total Chunks in Qdrant: {qdrant_count}")
-    print(f"Total Chunks in BM25: {bm25_count}")
-    print("Do they match? ", "YES!" if qdrant_count == bm25_count else "NO!")
+    print(f"\n--- Sanity Check ---")
+    print(f"Qdrant: {qdrant_count} | BM25: {bm25_count} | Match: {'YES' if qdrant_count == bm25_count else 'NO'}")
+    
+    test_query = "What is BM25?"
+    
+    print("\n--- Pure BM25 (Alpha = 0.0) ---")
+    res_sparse = pipeline.hybrid_search(test_query, top_k=2, alpha=0.0)
+    for r in res_sparse:
+        print(f"Score: {r['fused_score']:.4f} | Text: {r['payload']['text']}")
+
+    print("\n--- Pure Vector (Alpha = 1.0) ---")
+    res_dense = pipeline.hybrid_search(test_query, top_k=2, alpha=1.0)
+    for r in res_dense:
+        print(f"Score: {r['fused_score']:.4f} | Text: {r['payload']['text']}")
+
+    print("\n--- Hybrid RRF (Alpha = 0.5) ---")
+    res_hybrid = pipeline.hybrid_search(test_query, top_k=2, alpha=0.5)
+    for r in res_hybrid:
+        print(f"Score: {r['fused_score']:.4f} | Dense Rank: {r['dense_rank']} | Sparse Rank: {r['sparse_rank']} | Text: {r['payload']['text']}")
