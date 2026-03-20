@@ -5,17 +5,13 @@ from openai import OpenAI
 from ingestion import HybridIndexer
 
 load_dotenv()
-
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:8000/v1")
 LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "local-model")
-LLM_API_KEY = os.getenv("LLM_API_KEY")
-
-if not LLM_API_KEY:
-    raise ValueError("CRITICAL: LLM_API_KEY not found. Please set it in your .env file.")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 
 NUM_EVAL_QUESTIONS = 10 
 TOP_K = 3
-RANDOM_SEED = 42 
+RANDOM_SEED = 42
 
 def generate_synthetic_qa(indexer: HybridIndexer, num_questions: int, client: OpenAI, model_name: str) -> list:
     print(f"\n--- Generating {num_questions} Synthetic Q&A Pairs ---")
@@ -99,16 +95,18 @@ def evaluate_retriever(indexer: HybridIndexer, qa_dataset: list, alpha: float, t
     }
 
 if __name__ == "__main__":
+    if not LLM_API_KEY:
+        raise ValueError("CRITICAL: LLM_API_KEY not found. Please set it in your .env file.")
     indexer = HybridIndexer()
-    test_doc = "README.md" 
     
+    test_doc = "README.md" 
     try:
         indexer.ingest_document(test_doc, chunk_size=400, chunk_overlap=50)
     except FileNotFoundError:
         print(f"Error: Could not find '{test_doc}'. Please update the path.")
         exit(1)
-
-    dataset = generate_synthetic_qa(indexer, NUM_EVAL_QUESTIONS)
+    eval_client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
+    dataset = generate_synthetic_qa(indexer, NUM_EVAL_QUESTIONS, client=eval_client, model_name=LLM_MODEL_NAME)
     
     if not dataset:
         print("Failed to generate dataset. Check your LLM connection.")

@@ -18,7 +18,7 @@ st.title("Hybrid RAG: Retrieval Quality Dashboard")
 
 if "indexer" not in st.session_state:
     st.session_state.indexer = HybridIndexer()
-    st.session_state.is_ready = False
+    st.session_state.is_ready = len(st.session_state.indexer.bm25_id_map) > 0
 
 indexer: HybridIndexer = st.session_state.indexer
 

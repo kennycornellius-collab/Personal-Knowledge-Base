@@ -1,5 +1,7 @@
 import uuid
 import re
+import json 
+import os   
 from pathlib import Path
 from typing import List
 
@@ -13,22 +15,63 @@ from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
 
 class HybridIndexer:
-    def __init__(self, collection_name: str = "local_knowledge_base"):
-        print("Initializing Local Embedding Model (all-MiniLM-L6-v2)...")
+    def __init__(self, collection_name: str = "local_knowledge_base", persist_dir: str = "./db_storage"):
+        print("Initializing Local Embedding Model (all-MiniLM-L6-v2)")
         self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
         self.vector_size = self.embedding_model.get_sentence_embedding_dimension()
         
-        print("Initializing Qdrant (In-Memory)")
-        self.qdrant = QdrantClient(location=":memory:")
         self.collection_name = collection_name
+        self.persist_dir = persist_dir
+        self.bm25_state_file = Path(self.persist_dir) / "bm25_state.json"
+        
+        os.makedirs(self.persist_dir, exist_ok=True)
+        
+        print(f"Initializing Qdrant (Persistent at {self.persist_dir})...")
 
-        self.qdrant.create_collection(
-            collection_name=self.collection_name,
-            vectors_config=VectorParams(size=self.vector_size, distance=Distance.COSINE),
-        )
-        self.bm25_id_map: List[str] = []       
-        self.bm25_tokenized: List[List[str]] = [] 
-        self.bm25_index = None
+        self.qdrant = QdrantClient(path=self.persist_dir)
+
+        if not self.qdrant.collection_exists(self.collection_name):
+            print(f"Creating new Qdrant collection: {self.collection_name}")
+            self.qdrant.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=VectorParams(size=self.vector_size, distance=Distance.COSINE),
+            )
+        else:
+            print(f"Loaded existing Qdrant collection: {self.collection_name}")
+
+        self._load_bm25_state()
+
+    def _load_bm25_state(self):
+        if self.bm25_state_file.exists():
+            print("Loading existing BM25 keyword index from disk...")
+            with open(self.bm25_state_file, 'r', encoding='utf-8') as f:
+                state = json.load(f)
+                self.bm25_id_map = state.get("id_map", [])
+                self.bm25_tokenized = state.get("tokenized", [])
+                self.ingested_sources = set(state.get("ingested_sources", []))
+                
+            if self.bm25_tokenized:
+                self.bm25_index = BM25Okapi(self.bm25_tokenized)
+            else:
+                self.bm25_index = None
+        else:
+            print("No existing BM25 state found. Starting fresh.")
+            self.bm25_id_map: List[str] = []       
+            self.bm25_tokenized: List[List[str]] = [] 
+            self.bm25_index = None
+            self.ingested_sources = set()
+
+        qdrant_count = self.qdrant.count(self.collection_name).count
+        if qdrant_count != len(self.bm25_id_map):
+            print(f"WARNING: Qdrant ({qdrant_count}) and BM25 ({len(self.bm25_id_map)}) are out of sync. Consider clearing {self.persist_dir} and re-ingesting.")
+
+    def _save_bm25_state(self):
+        with open(self.bm25_state_file, 'w', encoding='utf-8') as f:
+            json.dump({
+                "id_map": self.bm25_id_map,
+                "tokenized": self.bm25_tokenized,
+                "ingested_sources": list(self.ingested_sources) 
+            }, f)
 
     def extract_text(self, file_path: str) -> str:
         path = Path(file_path)
@@ -46,6 +89,11 @@ class HybridIndexer:
 
     def ingest_document(self, file_path: str, chunk_size: int = 500, chunk_overlap: int = 50, source_name: str = None):
         display_name = source_name or Path(file_path).name
+        
+        if display_name in self.ingested_sources:
+            print(f"Skipping '{display_name}' — already ingested.")
+            return
+            
         print(f"\n--- Ingesting: {display_name} ---")
         
         raw_text = self.extract_text(file_path)
@@ -58,21 +106,16 @@ class HybridIndexer:
         chunks = splitter.split_text(raw_text)
         
         print(f"Batch encoding {len(chunks)} chunks")
-
         embeddings = self.embedding_model.encode(chunks, show_progress_bar=True, batch_size=32)
-        
         points = []
-        
         print("Preparing payloads and updating indices")
         for i, chunk_text in enumerate(chunks):
             chunk_id = str(uuid.uuid4())
-            
             metadata = {
                 "source": display_name, 
                 "chunk_index": i,
                 "text": chunk_text
             }
-
             points.append(
                 PointStruct(
                     id=chunk_id, 
@@ -80,7 +123,6 @@ class HybridIndexer:
                     payload=metadata
                 )
             )
-
             self.bm25_tokenized.append(self.tokenize_for_bm25(chunk_text))
             self.bm25_id_map.append(chunk_id)
 
@@ -88,8 +130,10 @@ class HybridIndexer:
             collection_name=self.collection_name,
             points=points
         )
+
         self.bm25_index = BM25Okapi(self.bm25_tokenized)
-        
+        self.ingested_sources.add(display_name)
+        self._save_bm25_state()
 
     def search_dense(self, query: str, limit: int = 50) -> List[dict]:
         query_vector = self.embedding_model.encode(query).tolist()
