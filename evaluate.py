@@ -17,18 +17,19 @@ NUM_EVAL_QUESTIONS = 10
 TOP_K = 3
 RANDOM_SEED = 42 
 
-def generate_synthetic_qa(indexer: HybridIndexer, num_questions: int) -> list:
+def generate_synthetic_qa(indexer: HybridIndexer, num_questions: int, client: OpenAI, model_name: str) -> list:
     print(f"\n--- Generating {num_questions} Synthetic Q&A Pairs ---")
     random.seed(RANDOM_SEED)
-    
     all_uuids = indexer.bm25_id_map
+    if len(all_uuids) < num_questions * 3:
+        print(f"Warning: Corpus ({len(all_uuids)} chunks) is small relative to requested questions. You may not reach the target number. Consider ingesting more documents.")
+        
     shuffled_ids = all_uuids.copy()
     random.shuffle(shuffled_ids)
     
-    client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
     qa_dataset = []
-    candidate_ids = shuffled_ids[:min(num_questions * 3, len(shuffled_ids))]
     
+    candidate_ids = shuffled_ids[:min(num_questions * 3, len(shuffled_ids))]
     candidate_points = indexer.qdrant.retrieve(
         collection_name=indexer.collection_name, 
         ids=candidate_ids
@@ -50,7 +51,7 @@ def generate_synthetic_qa(indexer: HybridIndexer, num_questions: int) -> list:
         
         try:
             response = client.chat.completions.create(
-                model=LLM_MODEL_NAME,
+                model=model_name,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": f"Text Snippet:\n{chunk_text}"}
@@ -63,7 +64,7 @@ def generate_synthetic_qa(indexer: HybridIndexer, num_questions: int) -> list:
             
             qa_dataset.append({
                 "question": question,
-                "target_chunk_id": point.id 
+                "target_chunk_id": point.id
             })
         except Exception as e:
             print(f"Failed to generate question: {e}")
